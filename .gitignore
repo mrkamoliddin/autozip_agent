@@ -1,0 +1,6 @@
+.env
+pending_replies.json
+seen_ids.json
+agent.log
+__pycache__/
+venv/
