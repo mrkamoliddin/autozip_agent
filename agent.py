@@ -469,34 +469,34 @@ def fetch_sent_emails(limit: int = 20) -> list:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
 
-        # Yandex Sent papkasini topish — LIST orqali
-        selected = False
+        # Barcha papkalarni ko'ramiz
         _, folders = mail.list()
+        log.info(f"IMAP papkalar: {[f.decode('utf-8', errors='replace') if isinstance(f, bytes) else f for f in folders]}")
+
+        selected = False
         for f in folders:
             f_str = f.decode("utf-8", errors="replace") if isinstance(f, bytes) else f
-            if any(name in f_str for name in ["Отправленные", "Sent", "INBOX.Sent"]):
-                # Papka nomini ajratib olamiz
-                parts = f_str.split('"')
-                folder_name = parts[-2] if len(parts) >= 2 else "Sent"
+            # Sent papkasini topamiz
+            if any(name.lower() in f_str.lower() for name in ["sent", "отправлен"]):
+                # Papka nomini oxirgi qismidan ajratamiz
+                # Format: (\HasNoChildren) "|" "Sent"
+                if '"|"' in f_str or '" "' in f_str:
+                    folder_name = f_str.split('"')[-2]
+                else:
+                    folder_name = f_str.split()[-1].strip('"')
+                log.info(f"Sent papkasi topildi: {folder_name}")
                 result, _ = mail.select(f'"{folder_name}"')
                 if result == "OK":
                     selected = True
                     break
 
         if not selected:
-            # Fallback — oddiy nomlar bilan urinib ko'ramiz
-            for folder in ["Sent", "INBOX.Sent", "Sent Items"]:
-                result, _ = mail.select(folder)
-                if result == "OK":
-                    selected = True
-                    break
-
-        if not selected:
-            log.warning("Sent papkasi topilmadi")
+            log.error("Sent papkasi topilmadi")
             return []
 
         _, data = mail.search(None, "ALL")
         ids = data[0].split()
+        log.info(f"Sent papkasida {len(ids)} ta xat")
         recent_ids = ids[-limit:] if len(ids) >= limit else ids
 
         for uid in reversed(recent_ids):
@@ -658,22 +658,73 @@ def _fetch_inbox_by_criteria(criteria: str, limit: int = 50) -> list:
 
 def fetch_new_inbox_emails() -> list:
     """
-    'Янgi xabarlar' bo'limi uchun: o'qilmagan + bugun kelgan xatlar.
+    'Непрочитанные' bo'limi: o'qilmagan + bugun kelgan xatlar.
+    Bitta IMAP ulanishda bajaradi.
     """
-    today = datetime.now().strftime("%d-%b-%Y")
-    # UNSEEN yoki bugun kelgan
-    unseen = _fetch_inbox_by_criteria("UNSEEN")
-    today_seen = _fetch_inbox_by_criteria(f"SEEN SINCE {today}")
-    # Ikkalasini birlashtir, uid bo'yicha deduplikatsiya
-    seen_uids = {e["uid"] for e in unseen}
-    combined = unseen + [e for e in today_seen if e["uid"] not in seen_uids]
-    combined.sort(key=lambda x: x["date_obj"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-    return combined
+    emails = []
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
+        mail.select("INBOX")
+
+        today = datetime.now().strftime("%d-%b-%Y")
+
+        # O'qilmagan xatlar
+        _, unseen_data = mail.search(None, "UNSEEN")
+        unseen_ids = set(unseen_data[0].split())
+
+        # Bugun kelgan o'qilgan xatlar
+        _, today_data = mail.search(None, f"SEEN SINCE {today}")
+        today_ids = today_data[0].split()
+
+        # Birlashtirish — unseen birinchi
+        all_ids = list(unseen_ids) + [uid for uid in today_ids if uid not in unseen_ids]
+
+        for uid in all_ids:
+            uid_str = uid.decode() if isinstance(uid, bytes) else uid
+            _, msg_data = mail.fetch(uid if isinstance(uid, bytes) else uid.encode(),
+                                     "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+            raw_headers = msg_data[0][1]
+            msg = email.message_from_bytes(raw_headers)
+
+            sender   = decode_str(msg.get("From", ""))
+            subject  = decode_str(msg.get("Subject", "(без темы)"))
+            date_str = msg.get("Date", "")
+            flags_raw = msg_data[0][0].decode() if isinstance(msg_data[0][0], bytes) else str(msg_data[0][0])
+            seen = "\\Seen" in flags_raw
+
+            date_obj = None
+            try:
+                date_obj = parsedate_to_datetime(date_str)
+                if date_obj.tzinfo is None:
+                    date_obj = date_obj.replace(tzinfo=timezone.utc)
+            except Exception:
+                date_obj = datetime.now(tz=timezone.utc)
+
+            emails.append({
+                "uid":      uid_str,
+                "sender":   sender,
+                "subject":  subject,
+                "date":     date_str,
+                "date_obj": date_obj,
+                "seen":     seen,
+            })
+
+    except Exception as e:
+        log.error(f"fetch_new_inbox_emails xato: {e}")
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+    emails.sort(key=lambda x: x["date_obj"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return emails
 
 def fetch_read_inbox_emails(days: int = 30) -> list:
-    """
-    'Kiruvchi xabarlar' bo'limi uchun: faqat o'qilgan (SEEN) xatlar.
-    """
+    """'Входящие' bo'limi: faqat o'qilgan (SEEN) xatlar."""
     since_date = (datetime.now() - timedelta(days=days + 1)).strftime("%d-%b-%Y")
     return _fetch_inbox_by_criteria(f"SEEN SINCE {since_date}")
 
