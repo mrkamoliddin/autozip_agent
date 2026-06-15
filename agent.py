@@ -476,18 +476,15 @@ def fetch_sent_emails(limit: int = 20) -> list:
         selected = False
         for f in folders:
             f_str = f.decode("utf-8", errors="replace") if isinstance(f, bytes) else f
-            # Sent papkasini topamiz
-            if any(name.lower() in f_str.lower() for name in ["sent", "отправлен"]):
-                # Papka nomini oxirgi qismidan ajratamiz
-                # Format: (\HasNoChildren) "|" "Sent"
-                if '"|"' in f_str or '" "' in f_str:
-                    folder_name = f_str.split('"')[-2]
-                else:
-                    folder_name = f_str.split()[-1].strip('"')
-                log.info(f"Sent papkasi topildi: {folder_name}")
-                result, _ = mail.select(f'"{folder_name}"')
+            parts = f_str.rsplit('"|"', 1)
+            if len(parts) < 2:
+                continue
+            folder_name = parts[1].strip().strip('"')
+            if any(name.lower() in folder_name.lower() for name in ["sent", "отправлен"]):
+                result, _ = mail.select(folder_name)
                 if result == "OK":
                     selected = True
+                    log.info(f"Sent papkasi tanlandi: '{folder_name}'")
                     break
 
         if not selected:
@@ -603,23 +600,25 @@ def fetch_all_counts() -> dict:
         counts["unread"] = len(unseen_ids)
         counts["inbox"]  = len(all_ids)
 
-        # Sent papkasini topamiz
-        _, folders = mail.list()
-        # Debug: barcha papka nomlarini logga chiqaramiz
-        for f in folders:
-            f_str = f.decode("utf-8", errors="replace") if isinstance(f, bytes) else f
-            log.info(f"IMAP papka: {f_str}")
+        # Sent papkasini topamiz — to'g'ridan nomi bilan
         sent_found = False
+        _, folders = mail.list()
         for f in folders:
             f_str = f.decode("utf-8", errors="replace") if isinstance(f, bytes) else f
-            if any(name.lower() in f_str.lower() for name in ["sent", "отправлен"]):
-                folder_name = f_str.split('"')[-2] if '"' in f_str else f_str.split()[-1].strip('"')
-                result, _ = mail.select(f'"{folder_name}"')
+            # Oxirgi qism: "|" Sent  yoki "|" "Drafts|template"
+            parts = f_str.rsplit('"|"', 1)
+            if len(parts) < 2:
+                continue
+            folder_name = parts[1].strip().strip('"')
+            if any(name.lower() in folder_name.lower() for name in ["sent", "отправлен"]):
+                # Qo'shtirnoqsiz select qilamiz
+                result, _ = mail.select(folder_name)
                 if result == "OK":
                     _, sent_data = mail.search(None, "ALL")
                     sent_ids = [x for x in sent_data[0].split() if x]
                     counts["sent"] = len(sent_ids)
                     sent_found = True
+                    log.info(f"Sent papkasi: '{folder_name}', xatlar: {counts['sent']}")
                     break
 
         if not sent_found:
