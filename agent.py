@@ -94,7 +94,8 @@ CHECK_INTERVAL    = int(os.environ.get("CHECK_INTERVAL", "60"))
 
 SEEN_IDS_FILE       = "seen_ids.json"
 PENDING_FILE        = "pending_replies.json"
-LAST_UPDATE_FILE    = "last_update_id.json"   # FIX 4: last_update_id saqlash uchun
+LAST_UPDATE_FILE    = "last_update_id.json"
+MENU_MESSAGE_FILE   = "menu_message_ids.json"  # Menyu xabar ID lari
 IMAP_HOST           = "imap.yandex.ru"
 IMAP_PORT           = 993
 SMTP_HOST           = "smtp.yandex.ru"
@@ -104,7 +105,7 @@ SEEN_IDS_MAX        = 1000
 PENDING_MAX_DAYS    = 30
 OPENAI_MAX_RETRIES  = 5
 OPENAI_RETRY_DELAY  = 3
-INBOX_PAGE_SIZE     = 10   # Sahifada nechta xat ko'rsatilsin
+INBOX_PAGE_SIZE     = 3    # Количество писем на странице
 
 LOGO_PATH = Path(__file__).parent / "autozip_logo_email.png"
 
@@ -428,7 +429,6 @@ def send_telegram(text: str, chat_id: str = None, reply_markup: dict = None):
 
 def format_telegram_message(sender: str, subject: str, analysis: str) -> str:
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    # FIX 7: sender va subject ichidagi maxsus belgilarni ekranlash
     safe_sender  = escape_markdown(sender)
     safe_subject = escape_markdown(subject)
     return (
@@ -441,48 +441,185 @@ def format_telegram_message(sender: str, subject: str, analysis: str) -> str:
         f"{analysis}"
     )
 
-# ─── INBOX RO'YXATI ───────────────────────────────────────────────────────────
+def edit_telegram_message(chat_id: str, message_id: int, text: str, reply_markup: dict = None):
+    """Mavjud Telegram xabarni tahrirlash (badge yangilash uchun)."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+    payload = {
+        "chat_id":    chat_id,
+        "message_id": message_id,
+        "text":       text,
+        "parse_mode": "Markdown"
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if not resp.ok:
+            # Xabar o'zgarmaganda Telegram 400 qaytaradi — bu normal
+            if "message is not modified" not in resp.text:
+                log.warning(f"editMessage xato: {resp.text}")
+    except Exception as e:
+        log.warning(f"editMessage exception: {e}")
 
-def fetch_inbox_emails(days: int = 7) -> list:
+def fetch_sent_emails(limit: int = 20) -> list:
+    """Sent papkasidan yuborilgan xatlarni olish."""
+    sent_emails = []
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
+
+        # Yandex Sent papkasi
+        for folder in ['"Отправленные"', "Sent", "INBOX.Sent"]:
+            result, _ = mail.select(folder)
+            if result == "OK":
+                break
+
+        _, data = mail.search(None, "ALL")
+        ids = data[0].split()
+        recent_ids = ids[-limit:] if len(ids) >= limit else ids
+
+        for uid in reversed(recent_ids):
+            _, msg_data = mail.fetch(uid, "(FLAGS BODY.PEEK[HEADER.FIELDS (TO SUBJECT DATE)])")
+            raw_headers = msg_data[0][1]
+            msg = email.message_from_bytes(raw_headers)
+
+            to_addr = decode_str(msg.get("To", ""))
+            subject  = decode_str(msg.get("Subject", "(без темы)"))
+            date_str = msg.get("Date", "")
+
+            date_obj = None
+            try:
+                date_obj = parsedate_to_datetime(date_str)
+                if date_obj.tzinfo is None:
+                    date_obj = date_obj.replace(tzinfo=timezone.utc)
+            except Exception:
+                date_obj = datetime.now(tz=timezone.utc)
+
+            sent_emails.append({
+                "to":       to_addr,
+                "subject":  subject,
+                "date":     date_str,
+                "date_obj": date_obj,
+            })
+
+    except Exception as e:
+        log.error(f"fetch_sent_emails xato: {e}")
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+    return sent_emails
+
+def build_menu_text(unread_count: int, new_badge: bool = False) -> tuple:
+    """Asosiy 4 bo'limli menyu — rus tilida."""
+    badge = " 🔴" if new_badge else ""
+    new_label = f"🆕 Новые сообщения ({unread_count}){badge}" if unread_count > 0 else f"🆕 Новые сообщения{badge}"
+
+    text = (
+        f"🏠 *AutoZIP Email Agent*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Выберите раздел:"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": new_label,                    "callback_data": "menu:new"}],
+            [{"text": "📥 Входящие сообщения",      "callback_data": "menu:inbox"}],
+            [{"text": "📤 Отправленные сообщения",  "callback_data": "menu:sent"}],
+            [{"text": "🔍 Поиск нового клиента",    "callback_data": "menu:search"}],
+        ]
+    }
+    return text, keyboard
+
+def send_main_menu(chat_id: str, unread_count: int = 0) -> int | None:
     """
-    Inboxdagi barcha xatlarni (o'qilgan + o'qilmagan) sana bo'yicha olish.
-    Qaytaradi: [{"uid", "sender", "subject", "date", "seen", "date_obj"}, ...]
-    Eng yangilar birinchi.
+    Asosiy menyuni yuboradi va message_id ni qaytaradi.
+    Qaytarilgan ID keyinchalik badge yangilash uchun saqlanadi.
     """
+    text, keyboard = build_menu_text(unread_count)
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id":      chat_id,
+        "text":         text,
+        "parse_mode":   "Markdown",
+        "reply_markup": keyboard
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.ok:
+            return resp.json()["result"]["message_id"]
+        else:
+            log.error(f"send_main_menu xato: {resp.text}")
+    except Exception as e:
+        log.error(f"send_main_menu exception: {e}")
+    return None
+
+def update_menu_badge(menu_msg_ids: dict, unread_count: int, new_badge: bool = False):
+    """
+    Har bir admindagi menyu xabarini yangilaydi (badge qo'shadi/olib tashlaydi).
+    menu_msg_ids = {chat_id: message_id}
+    """
+    text, keyboard = build_menu_text(unread_count, new_badge=new_badge)
+    for cid, mid in menu_msg_ids.items():
+        if mid:
+            edit_telegram_message(cid, mid, text, reply_markup=keyboard)
+
+def count_unread_inbox() -> int:
+    """IMAP dan o'qilmagan xatlar sonini olish."""
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
+        mail.select("INBOX")
+        _, data = mail.search(None, "UNSEEN")
+        ids = data[0].split()
+        return len(ids)
+    except Exception as e:
+        log.warning(f"count_unread_inbox xato: {e}")
+        return 0
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+
+
+def _fetch_inbox_by_criteria(criteria: str, limit: int = 50) -> list:
+    """IMAP search criteria bo'yicha xatlarni oluvchi ichki funksiya."""
     emails = []
     mail = None
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
         mail.select("INBOX")
-
-        # FIX 4: +1 kun buffer — IMAP SINCE kun boshidan hisoblagani uchun
-        since_date = (datetime.now() - timedelta(days=days + 1)).strftime("%d-%b-%Y")
-        _, data = mail.search(None, f'SINCE {since_date}')
+        _, data = mail.search(None, criteria)
         ids = data[0].split()
+        recent_ids = ids[-limit:] if len(ids) > limit else ids
 
-        for uid in ids:
+        for uid in reversed(recent_ids):
             uid_str = uid.decode()
-            # Faqat sarlavha va flags — tezroq
             _, msg_data = mail.fetch(uid, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
             raw_headers = msg_data[0][1]
             msg = email.message_from_bytes(raw_headers)
 
-            sender  = decode_str(msg.get("From", ""))
-            subject = decode_str(msg.get("Subject", "(без темы)"))
+            sender   = decode_str(msg.get("From", ""))
+            subject  = decode_str(msg.get("Subject", "(без темы)"))
             date_str = msg.get("Date", "")
 
-            # O'qilgan/o'qilmagan
-            flags_data = msg_data[0][0].decode() if isinstance(msg_data[0][0], bytes) else str(msg_data[0][0])
-            seen = "\\Seen" in flags_data
+            flags_raw = msg_data[0][0].decode() if isinstance(msg_data[0][0], bytes) else str(msg_data[0][0])
+            seen = "\\Seen" in flags_raw
 
-            # Sana parse
             date_obj = None
             try:
-                from email.utils import parsedate_to_datetime
                 date_obj = parsedate_to_datetime(date_str)
+                if date_obj.tzinfo is None:
+                    date_obj = date_obj.replace(tzinfo=timezone.utc)
             except Exception:
-                date_obj = datetime.now()
+                date_obj = datetime.now(tz=timezone.utc)
 
             emails.append({
                 "uid":      uid_str,
@@ -492,19 +629,38 @@ def fetch_inbox_emails(days: int = 7) -> list:
                 "date_obj": date_obj,
                 "seen":     seen,
             })
-
     except Exception as e:
-        log.error(f"fetch_inbox_emails xato: {e}")
+        log.error(f"_fetch_inbox_by_criteria ({criteria}) xato: {e}")
     finally:
         if mail:
             try:
                 mail.logout()
             except Exception:
                 pass
-
-    # Eng yangilar birinchi
-    emails.sort(key=lambda x: x["date_obj"] or datetime.min, reverse=True)
+    emails.sort(key=lambda x: x["date_obj"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return emails
+
+def fetch_new_inbox_emails() -> list:
+    """
+    'Янgi xabarlar' bo'limi uchun: o'qilmagan + bugun kelgan xatlar.
+    """
+    today = datetime.now().strftime("%d-%b-%Y")
+    # UNSEEN yoki bugun kelgan
+    unseen = _fetch_inbox_by_criteria("UNSEEN")
+    today_seen = _fetch_inbox_by_criteria(f"SEEN SINCE {today}")
+    # Ikkalasini birlashtir, uid bo'yicha deduplikatsiya
+    seen_uids = {e["uid"] for e in unseen}
+    combined = unseen + [e for e in today_seen if e["uid"] not in seen_uids]
+    combined.sort(key=lambda x: x["date_obj"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return combined
+
+def fetch_read_inbox_emails(days: int = 30) -> list:
+    """
+    'Kiruvchi xabarlar' bo'limi uchun: faqat o'qilgan (SEEN) xatlar.
+    """
+    since_date = (datetime.now() - timedelta(days=days + 1)).strftime("%d-%b-%Y")
+    return _fetch_inbox_by_criteria(f"SEEN SINCE {since_date}")
+
 
 
 def fetch_email_full(uid_str: str) -> dict | None:
@@ -548,100 +704,101 @@ def safe_callback(data: str) -> str:
     return data
 
 
-def send_inbox_list(chat_id: str, emails: list, page: int = 0, days: int = 7):
+def send_email_list(chat_id: str, emails: list, page: int = 0,
+                    section: str = "inbox", title: str = "📬 *ВХОДЯЩИЕ*"):
     """
-    Inbox ro'yxatini Telegramga yuborish.
-    Sahifama-sahifa: 10 tadan, « » navigatsiya tugmalari.
+    Список писем с пагинацией (3 на страницу).
+    Каждое письмо показывается отдельным блоком с кнопкой Открыть.
     """
     total = len(emails)
     if total == 0:
         send_telegram(
-            f"📭 *Inbox bo'sh*\nOxirgi {days} kunda xat topilmadi.",
-            chat_id=chat_id
+            "📭 *Писем не найдено.*",
+            chat_id=chat_id,
+            reply_markup={"inline_keyboard": [[
+                {"text": "🏠 Главное меню", "callback_data": "menu:main"}
+            ]]}
         )
         return
 
-    start = page * INBOX_PAGE_SIZE
-    end   = min(start + INBOX_PAGE_SIZE, total)
+    start       = page * INBOX_PAGE_SIZE
+    end         = min(start + INBOX_PAGE_SIZE, total)
     page_emails = emails[start:end]
     total_pages = (total + INBOX_PAGE_SIZE - 1) // INBOX_PAGE_SIZE
 
-    unseen_count = sum(1 for e in emails if not e["seen"])
-    lines = [
-        f"📬 *INBOX — oxirgi {days} kun*",
-        f"Jami: *{total}* xat  |  O'qilmagan: *{unseen_count}*",
-        f"Sahifa {page+1}/{total_pages}",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
+    # Sarlavha
+    send_telegram(
+        f"{title}\nВсего: *{total}*  |  Стр. {page+1}/{total_pages}\n━━━━━━━━━━━━━━━━━━━━",
+        chat_id=chat_id
+    )
+
+    # Har bir xat alohida xabar + Открыть tugmasi
     for i, em in enumerate(page_emails, start=start+1):
-        icon    = "🔴" if not em["seen"] else "⚪"
+        icon = "🔴" if not em.get("seen", True) else "⚪"
         try:
-            d = em["date_obj"].strftime("%d.%m %H:%M") if em["date_obj"] else "—"
+            d = em["date_obj"].strftime("%d.%m %H:%M") if em.get("date_obj") else "—"
         except Exception:
             d = "—"
-        sender_short = escape_markdown(extract_email_address(em["sender"]))
-        subject_short = escape_markdown(em["subject"][:40])
-        lines.append(f"{icon} *{i}.* {subject_short}\n    👤 `{sender_short}` · {d}")
+        sender_short  = escape_markdown(extract_email_address(em.get("sender", em.get("to", ""))))
+        subject_short = escape_markdown(em.get("subject", "")[:45])
 
-    text = "\n".join(lines)
+        text = f"{icon} *{i}.* {subject_short}\n👤 `{sender_short}` · {d}"
+        cb   = safe_callback(f"view_email:{em['uid']}:{section}:{page}")
 
-    # Inline keyboard: har xat uchun tugma + navigatsiya
-    keyboard = []
-    for i, em in enumerate(page_emails, start=start+1):
-        icon = "🔴" if not em["seen"] else "⚪"
-        btn_label = f"{icon} {i}. {em['subject'][:30]}"
-        cb = safe_callback(f"view_email:{em['uid']}:{days}:{page}")  # FIX 5
-        keyboard.append([{"text": btn_label, "callback_data": cb}])
+        is_last = (i == start + len(page_emails))
+        nav_row = []
+        if page > 0:
+            nav_row.append({"text": "« Назад", "callback_data": f"list_page:{section}:{page-1}"})
+        if end < total:
+            nav_row.append({"text": "Вперёд »", "callback_data": f"list_page:{section}:{page+1}"})
 
-    # Navigatsiya qatori
-    nav_row = []
-    if page > 0:
-        nav_row.append({"text": "« Oldingi", "callback_data": f"inbox_page:{days}:{page-1}"})
-    if end < total:
-        nav_row.append({"text": "Keyingi »", "callback_data": f"inbox_page:{days}:{page+1}"})
-    if nav_row:
-        keyboard.append(nav_row)
+        keyboard_rows = [[{"text": "📂 Открыть", "callback_data": cb}]]
+        if is_last:
+            if nav_row:
+                keyboard_rows.append(nav_row)
+            keyboard_rows.append([{"text": "🏠 Главное меню", "callback_data": "menu:main"}])
 
-    # Sana filtri tugmalari
-    keyboard.append([
-        {"text": "📅 7 kun", "callback_data": f"inbox_page:7:0"},
-        {"text": "📅 30 kun", "callback_data": f"inbox_page:30:0"},
-    ])
-
-    send_telegram(text, chat_id=chat_id, reply_markup={"inline_keyboard": keyboard})
+        send_telegram(text, chat_id=chat_id, reply_markup={"inline_keyboard": keyboard_rows})
+        time.sleep(0.3)
 
 
-def send_email_detail(chat_id: str, uid_str: str, back_days: int = 7, back_page: int = 0, pending: dict = None):
+
+def send_email_detail(chat_id: str, uid_str: str, back_section: str = "new",
+                      back_page: int = 0, pending: dict = None):
     """
-    Xatni to'liq ko'rsatish: tarix + har xat uchun javob tugmasi.
-    Har doim pending dict qaytaradi (hech qachon None emas).
+    Показать полное письмо: история + кнопка ответа для каждого.
+    Всегда возвращает pending dict.
     """
     if pending is None:
         pending = {}
 
-    send_telegram("⏳ *Xat yuklanmoqda...*", chat_id=chat_id)
+    send_telegram("⏳ *Загружаю письмо...*", chat_id=chat_id)
     em = fetch_email_full(uid_str)
     if not em:
-        send_telegram("❌ *Xatni yuklashda xato.*", chat_id=chat_id)
-        return pending  # FIX 1: None emas, pending qaytaramiz
+        send_telegram(
+            "❌ *Ошибка загрузки письма.*",
+            chat_id=chat_id,
+            reply_markup={"inline_keyboard": [[
+                {"text": "◀ Назад", "callback_data": f"list_page:{back_section}:{back_page}"},
+                {"text": "🏠 Главное меню", "callback_data": "menu:main"},
+            ]]}
+        )
+        return pending
 
     sender_safe  = escape_markdown(em["sender"])
     subject_safe = escape_markdown(em["subject"])
+    body_preview = em["body"][:2000] if em["body"] else "_(пусто)_"
 
-    # Asosiy xat
-    body_preview = em["body"][:2000] if em["body"] else "_(bo'sh)_"
     msg_text = (
-        f"📧 *XAT TAFSILOTI*\n"
+        f"📧 *ДЕТАЛИ ПИСЬМА*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 *Kimdan:* `{sender_safe}`\n"
-        f"📌 *Mavzu:* {subject_safe}\n"
-        f"🕐 *Sana:* {escape_markdown(em['date'][:30])}\n"
+        f"👤 *От кого:* `{sender_safe}`\n"
+        f"📌 *Тема:* {subject_safe}\n"
+        f"🕐 *Дата:* {escape_markdown(em['date'][:30])}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{body_preview}"
     )
 
-    # Asosiy xat uchun tugmalar
-    # pending ga qo'shib qo'yamiz (agar yo'q bo'lsa)
     if uid_str not in pending:
         pending[uid_str] = {
             "sender":     em["sender"],
@@ -654,21 +811,20 @@ def send_email_detail(chat_id: str, uid_str: str, back_days: int = 7, back_page:
 
     main_keyboard = {
         "inline_keyboard": [
+            [{"text": "✍️ Ответить", "callback_data": f"reply:{uid_str}"}],
             [
-                {"text": "✍️ Javob yozish", "callback_data": f"reply:{uid_str}"},
-            ],
-            [
-                {"text": "◀ Orqaga", "callback_data": f"inbox_page:{back_days}:{back_page}"}
+                {"text": "◀ Назад",         "callback_data": f"list_page:{back_section}:{back_page}"},
+                {"text": "🏠 Главное меню", "callback_data": "menu:main"},
             ]
         ]
     }
     send_telegram(msg_text, chat_id=chat_id, reply_markup=main_keyboard)
 
-    # Tarix xatlarini ham ko'rsatamiz
+    # Предыдущие письма этого клиента
     history = em.get("history", [])
     if history:
         send_telegram(
-            f"🔄 *Bu mijozning avvalgi {len(history)} ta xati:*",
+            f"🔄 *Предыдущие письма этого клиента ({len(history)} шт.):*",
             chat_id=chat_id
         )
         pending_changed = False
@@ -678,7 +834,7 @@ def send_email_detail(chat_id: str, uid_str: str, back_days: int = 7, back_page:
             h_body    = h.get("body", "")[:1500]
 
             h_text = (
-                f"📨 *{i}-xat*\n"
+                f"📨 *Письмо {i}*\n"
                 f"📌 {h_subject}\n"
                 f"🕐 {h_date}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -693,21 +849,34 @@ def send_email_detail(chat_id: str, uid_str: str, back_days: int = 7, back_page:
                     "history":    [],
                     "created_at": datetime.now().isoformat()
                 }
-                pending_changed = True  # FIX 6: o'zgarish borligini belgilaymiz
+                pending_changed = True
 
             h_keyboard = {
                 "inline_keyboard": [[
-                    {"text": f"✍️ {i}-xatga javob", "callback_data": f"reply:{h_key}"}
+                    {"text": f"✍️ Ответить на письмо {i}", "callback_data": f"reply:{h_key}"}
                 ]]
             }
             send_telegram(h_text, chat_id=chat_id, reply_markup=h_keyboard)
 
-        # FIX 6: barcha tarix kalitlari qo'shilgandan keyin faqat bir marta saqlaymiz
         if pending_changed:
             save_json(PENDING_FILE, pending)
 
-    return pending
+    # Eng pastda — asosiy javob tugmasi
+    send_telegram(
+        f"✉️ *Ответить на это письмо:*",
+        chat_id=chat_id,
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": "✍️ Написать ответ", "callback_data": f"reply:{uid_str}"}],
+                [
+                    {"text": "◀ Назад",         "callback_data": f"list_page:{back_section}:{back_page}"},
+                    {"text": "🏠 Главное меню", "callback_data": "menu:main"},
+                ]
+            ]
+        }
+    )
 
+    return pending
 
 
 def fetch_sender_history(mail_conn, sender_email: str, limit: int = 5) -> list:
@@ -797,7 +966,7 @@ def answer_callback_query(callback_query_id: str):
     except Exception as e:
         log.warning(f"answerCallbackQuery exception: {e}")
 
-def handle_telegram_updates(pending: dict, last_update_id: int) -> tuple:
+def handle_telegram_updates(pending: dict, last_update_id: int, menu_msg_ids: dict) -> tuple:
     updates = get_telegram_updates(last_update_id + 1)
 
     for update in updates:
@@ -814,33 +983,221 @@ def handle_telegram_updates(pending: dict, last_update_id: int) -> tuple:
             if chat_id not in TELEGRAM_CHAT_IDS:
                 continue
 
-            # ── INBOX SAHIFASI NAVIGATSIYA ────────────────────────────
-            if data.startswith("inbox_page:"):
+            # ── ASOSIY MENYU TUGMALARI ────────────────────────────────
+            if data.startswith("menu:"):
+                section = data.split(":", 1)[1]
+
+                if section == "main":
+                    unread = count_unread_inbox()
+                    mid = send_main_menu(chat_id, unread_count=unread)
+                    if mid:
+                        menu_msg_ids[chat_id] = mid
+                        save_json(MENU_MESSAGE_FILE, menu_msg_ids)
+
+                elif section == "new":
+                    send_telegram("⏳ *Загружаю новые сообщения...*", chat_id=chat_id)
+                    new_emails = fetch_new_inbox_emails()
+
+                    if not new_emails:
+                        send_telegram(
+                            "📭 *Новых сообщений нет.*",
+                            chat_id=chat_id,
+                            reply_markup={"inline_keyboard": [[
+                                {"text": "🏠 Главное меню", "callback_data": "menu:main"}
+                            ]]}
+                        )
+                    else:
+                        # Sarlavha xabari
+                        send_telegram(
+                            f"🆕 *НОВЫЕ СООБЩЕНИЯ ({len(new_emails)})*\n━━━━━━━━━━━━━━━━━━━━",
+                            chat_id=chat_id
+                        )
+                        # Har bir xat uchun alohida xabar + Открыть tugmasi
+                        for i, em in enumerate(new_emails, 1):
+                            icon = "🔴" if not em.get("seen") else "⚪"
+                            try:
+                                d = em["date_obj"].strftime("%d.%m %H:%M")
+                            except Exception:
+                                d = "—"
+                            sender_short  = escape_markdown(extract_email_address(em["sender"]))
+                            subject_short = escape_markdown(em["subject"][:45])
+
+                            text = (
+                                f"{icon} *{i}.* {subject_short}\n"
+                                f"👤 `{sender_short}` · {d}"
+                            )
+                            cb = safe_callback(f"open_new:{em['uid']}")
+                            is_last = (i == len(new_emails))
+                            keyboard = {
+                                "inline_keyboard": [
+                                    [{"text": "📂 Открыть", "callback_data": cb}],
+                                ] + ([[{"text": "🏠 Главное меню", "callback_data": "menu:main"}]] if is_last else [])
+                            }
+                            send_telegram(text, chat_id=chat_id, reply_markup=keyboard)
+                            time.sleep(0.3)
+
+                elif section == "inbox":
+                    send_telegram("⏳ *Загружаю входящие...*", chat_id=chat_id)
+                    emails = fetch_read_inbox_emails(days=30)
+                    send_email_list(chat_id, emails, page=0, section="inbox",
+                                   title="📥 *ВХОДЯЩИЕ СООБЩЕНИЯ* (прочитанные)")
+
+                elif section == "sent":
+                    send_telegram("⏳ *Загружаю отправленные...*", chat_id=chat_id)
+                    sent = fetch_sent_emails(limit=50)
+                    if not sent:
+                        send_telegram(
+                            "📭 *Отправленных писем не найдено.*",
+                            chat_id=chat_id,
+                            reply_markup={"inline_keyboard": [[
+                                {"text": "🏠 Главное меню", "callback_data": "menu:main"}
+                            ]]}
+                        )
+                    else:
+                        total_sent  = len(sent)
+                        total_pages = (total_sent + INBOX_PAGE_SIZE - 1) // INBOX_PAGE_SIZE
+                        page_sent   = sent[:INBOX_PAGE_SIZE]
+
+                        send_telegram(
+                            f"📤 *ОТПРАВЛЕННЫЕ СООБЩЕНИЯ*\nВсего: *{total_sent}*  |  Стр. 1/{total_pages}\n━━━━━━━━━━━━━━━━━━━━",
+                            chat_id=chat_id
+                        )
+                        for i, s in enumerate(page_sent, 1):
+                            try:
+                                d = s["date_obj"].strftime("%d.%m %H:%M")
+                            except Exception:
+                                d = "—"
+                            to_name = escape_markdown(s["to"][:45])
+                            subj    = escape_markdown(s["subject"][:45])
+                            text    = f"📨 *{i}.* {subj}\n👤 `{to_name}` · {d}"
+
+                            is_last = (i == len(page_sent))
+                            keyboard_rows = [[{"text": "📂 Открыть", "callback_data": safe_callback(f"view_sent:{i-1}:0")}]]
+                            if is_last:
+                                if total_sent > INBOX_PAGE_SIZE:
+                                    keyboard_rows.append([{"text": "Вперёд »", "callback_data": "sent_page:1"}])
+                                keyboard_rows.append([{"text": "🏠 Главное меню", "callback_data": "menu:main"}])
+
+                            send_telegram(text, chat_id=chat_id, reply_markup={"inline_keyboard": keyboard_rows})
+                            time.sleep(0.3)
+
+                elif section == "search":
+                    send_telegram(
+                        "🔍 *Поиск нового клиента*\n\n_Этот раздел будет добавлен в ближайшее время._",
+                        chat_id=chat_id,
+                        reply_markup={"inline_keyboard": [[
+                            {"text": "🏠 Главное меню", "callback_data": "menu:main"}
+                        ]]}
+                    )
+
+            # ── RO'YXAT SAHIFASI NAVIGATSIYA ─────────────────────────
+            elif data.startswith("list_page:"):
                 parts = data.split(":")
                 try:
-                    days  = int(parts[1]) if len(parts) > 1 else 7
-                    page  = int(parts[2]) if len(parts) > 2 else 0
+                    sec  = parts[1] if len(parts) > 1 else "new"
+                    page = int(parts[2]) if len(parts) > 2 else 0
                 except ValueError:
-                    days, page = 7, 0  # FIX 3: buzilgan data — default qiymatlar
-                inbox_emails = fetch_inbox_emails(days=days)
-                send_inbox_list(chat_id, inbox_emails, page=page, days=days)
+                    sec, page = "new", 0
+                if sec == "new":
+                    emails = fetch_new_inbox_emails()
+                    send_email_list(chat_id, emails, page=page, section="new",
+                                   title="🆕 *НОВЫЕ СООБЩЕНИЯ*")
+                elif sec == "inbox":
+                    emails = fetch_read_inbox_emails(days=30)
+                    send_email_list(chat_id, emails, page=page, section="inbox",
+                                   title="📥 *ВХОДЯЩИЕ СООБЩЕНИЯ* (прочитанные)")
 
             # ── XAT TO'LIQ KO'RISH ───────────────────────────────────
             elif data.startswith("view_email:"):
                 parts = data.split(":")
                 try:
-                    uid_str   = parts[1] if len(parts) > 1 else ""
-                    back_days = int(parts[2]) if len(parts) > 2 else 7
-                    back_page = int(parts[3]) if len(parts) > 3 else 0
+                    uid_str      = parts[1] if len(parts) > 1 else ""
+                    back_section = parts[2] if len(parts) > 2 else "new"
+                    back_page    = int(parts[3]) if len(parts) > 3 else 0
                 except ValueError:
-                    uid_str, back_days, back_page = "", 7, 0  # FIX 3
+                    uid_str, back_section, back_page = "", "new", 0
                 if uid_str:
-                    result = send_email_detail(
+                    pending = send_email_detail(
                         chat_id, uid_str,
-                        back_days=back_days, back_page=back_page,
+                        back_section=back_section,
+                        back_page=back_page,
                         pending=pending
                     )
-                    pending = result  # FIX 1: har doim pending qaytariladi
+
+            # ── ESKI inbox_page KOLBEK (muvofiqlashuv) ───────────────
+            elif data.startswith("inbox_page:"):
+                parts = data.split(":")
+                try:
+                    page = int(parts[2]) if len(parts) > 2 else 0
+                except ValueError:
+                    page = 0
+                emails = fetch_new_inbox_emails()
+                send_email_list(chat_id, emails, page=page, section="new",
+                               title="🆕 *НОВЫЕ СООБЩЕНИЯ*")
+
+            # ── YANGI XATNI OCHISH — GPT TAHLIL ─────────────────────
+            elif data.startswith("open_new:"):
+                email_id = data.split(":", 1)[1]
+                send_telegram("⏳ *Анализирую письмо...*", chat_id=chat_id)
+
+                # To'liq xatni olamiz
+                if email_id not in pending:
+                    full = fetch_email_full(email_id)
+                    if not full:
+                        send_telegram(
+                            "❌ *Не удалось загрузить письмо.*",
+                            chat_id=chat_id,
+                            reply_markup={"inline_keyboard": [[
+                                {"text": "◀ Назад", "callback_data": "menu:new"},
+                                {"text": "🏠 Главное меню", "callback_data": "menu:main"},
+                            ]]}
+                        )
+                        continue
+                    pending[email_id] = {
+                        "sender":     full["sender"],
+                        "subject":    full["subject"],
+                        "body":       full["body"],
+                        "history":    full.get("history", []),
+                        "created_at": datetime.now().isoformat()
+                    }
+                    save_json(PENDING_FILE, pending)
+                    em_data = full
+                else:
+                    em_data = pending[email_id]
+
+                # GPT tahlil
+                try:
+                    analysis = analyze_email(
+                        em_data["sender"],
+                        em_data["subject"],
+                        em_data["body"],
+                        em_data.get("history", [])
+                    )
+                    message = format_telegram_message(
+                        em_data["sender"],
+                        em_data["subject"],
+                        analysis
+                    )
+                    reply_markup = {
+                        "inline_keyboard": [
+                            [{"text": "✍️ Ответить клиенту", "callback_data": f"reply:{email_id}"}],
+                            [
+                                {"text": "◀ Назад",         "callback_data": "menu:new"},
+                                {"text": "🏠 Главное меню", "callback_data": "menu:main"},
+                            ],
+                        ]
+                    }
+                    send_telegram(message, chat_id=chat_id, reply_markup=reply_markup)
+                except Exception as e:
+                    log.error(f"Ошибка анализа {email_id}: {e}")
+                    send_telegram(
+                        "❌ *Ошибка анализа. Попробуйте ещё раз.*",
+                        chat_id=chat_id,
+                        reply_markup={"inline_keyboard": [[
+                            {"text": "◀ Назад", "callback_data": "menu:new"},
+                            {"text": "🏠 Главное меню", "callback_data": "menu:main"},
+                        ]]}
+                    )
 
             # Javob yozish tugmasi
             elif data.startswith("reply:"):
@@ -936,17 +1293,14 @@ def handle_telegram_updates(pending: dict, last_update_id: int) -> tuple:
             if chat_id not in TELEGRAM_CHAT_IDS:
                 continue
 
-            # /inbox buyrug'i — inbox ro'yxatini ko'rsatish
-            if text.lower() in ("/inbox", "/start"):
-                # FIX 7: "yuklanmoqda" xabari keraksiz — faqat sana tugmalarini ko'rsatamiz
-                send_telegram(
-                    "📬 *Qaysi davr uchun inbox ko'rsatilsin?*",
-                    chat_id=chat_id,
-                    reply_markup={"inline_keyboard": [[
-                        {"text": "📅 Oxirgi 7 kun",  "callback_data": "inbox_page:7:0"},
-                        {"text": "📅 Oxirgi 30 kun", "callback_data": "inbox_page:30:0"},
-                    ]]}
-                )
+            # /start va /menu — asosiy menyuni ko'rsatish
+            if text.lower() in ("/start", "/menu"):
+                unread = count_unread_inbox()
+                mid = send_main_menu(chat_id, unread_count=unread)
+                if mid:
+                    menu_msg_ids = load_json(MENU_MESSAGE_FILE, {})
+                    menu_msg_ids[chat_id] = mid
+                    save_json(MENU_MESSAGE_FILE, menu_msg_ids)
                 continue
 
             # Boshqa / buyruqlarni e'tiborsiz qoldiramiz
@@ -1032,7 +1386,7 @@ def handle_telegram_updates(pending: dict, last_update_id: int) -> tuple:
     if updates:
         save_json(LAST_UPDATE_FILE, {"last_update_id": last_update_id})
 
-    return pending, last_update_id
+    return pending, last_update_id, menu_msg_ids
 
 # ─── ASOSIY TSIKL ─────────────────────────────────────────────────────────────
 
@@ -1041,69 +1395,80 @@ def main():
         log.error("TELEGRAM_CHAT_IDS yoki TELEGRAM_CHAT_ID .env da topilmadi!")
         sys.exit(1)
 
-    log.info("Email Agent запущен")
-    log.info(f"Telegram foydalanuvchilar: {len(TELEGRAM_CHAT_IDS)} ta")
+    log.info("Email-агент запущен")
+    log.info(f"Пользователей Telegram: {len(TELEGRAM_CHAT_IDS)} шт.")
     send_telegram("🤖 *Email-агент запущен!*\nНовые письма от клиентов будут автоматически анализироваться.")
 
-    # Ishga tushganda inbox ko'rsatish — sana tanlash tugmalari
-    send_telegram(
-        "📬 *Inbox qaysi davr uchun ko'rsatilsin?*",
-        reply_markup={"inline_keyboard": [[
-            {"text": "📅 Oxirgi 7 kun",  "callback_data": "inbox_page:7:0"},
-            {"text": "📅 Oxirgi 30 kun", "callback_data": "inbox_page:30:0"},
-        ]]}
-    )
+    # Ishga tushganda har bir admin uchun asosiy menyuni yuboramiz
+    unread_count = count_unread_inbox()
+    menu_msg_ids = {}
+    for cid in TELEGRAM_CHAT_IDS:
+        mid = send_main_menu(cid, unread_count=unread_count)
+        if mid:
+            menu_msg_ids[cid] = mid
+    save_json(MENU_MESSAGE_FILE, menu_msg_ids)
 
     seen_ids = set(load_json(SEEN_IDS_FILE, []))
     pending  = load_json(PENDING_FILE, {})
 
-    # FIX 4: last_update_id ni fayldan o'qiymiz — agent qayta ishlaganda eski updatelar qayta ishlanmaydi
     saved = load_json(LAST_UPDATE_FILE, {})
     last_update_id = saved.get("last_update_id", 0)
 
-    # FIX 9 (loop_count): tsikl hisoblagichi — last_update_id o'rniga ishlatiladi
     loop_count = 0
+    # Badge holati: True bo'lsa 🔴 ko'rsatilmoqda
+    badge_active = False
 
     while True:
         try:
-            pending, last_update_id = handle_telegram_updates(pending, last_update_id)
+            pending, last_update_id, menu_msg_ids = handle_telegram_updates(
+                pending, last_update_id, menu_msg_ids
+            )
 
-            log.info("Проверка почты...")
+            log.info("Проверяю почту...")
             new_emails = fetch_new_emails(seen_ids)
 
-            for em in new_emails:
-                log.info(f"Анализируется: {em['sender']}")
+            if new_emails:
+                for em in new_emails:
+                    log.info(f"Анализирую: {em['sender']}")
+                    email_id = em["uid"]
 
-                email_id = em["uid"]
+                    seen_ids.add(email_id)
+                    seen_ids = trim_seen_ids(seen_ids)
+                    save_json(SEEN_IDS_FILE, list(seen_ids))
 
-                # FIX 5: seen_ids ga AVVAL qo'shamiz — xabar yuborishda xato bo'lsa ikki marta ishlanmaydi
-                seen_ids.add(email_id)
-                seen_ids = trim_seen_ids(seen_ids)
-                save_json(SEEN_IDS_FILE, list(seen_ids))
+                    analysis = analyze_email(em["sender"], em["subject"], em["body"], em.get("history", []))
+                    message  = format_telegram_message(em["sender"], em["subject"], analysis)
 
-                analysis = analyze_email(em["sender"], em["subject"], em["body"], em.get("history", []))
-                message  = format_telegram_message(em["sender"], em["subject"], analysis)
+                    pending[email_id] = {
+                        "sender":     em["sender"],
+                        "subject":    em["subject"],
+                        "body":       em["body"],
+                        "history":    em.get("history", []),
+                        "created_at": datetime.now().isoformat()
+                    }
+                    save_json(PENDING_FILE, pending)
 
-                pending[email_id] = {
-                    "sender":     em["sender"],
-                    "subject":    em["subject"],
-                    "body":       em["body"],
-                    "history":    em.get("history", []),
-                    "created_at": datetime.now().isoformat()
-                }
-                save_json(PENDING_FILE, pending)
+                    reply_markup = {
+                        "inline_keyboard": [[
+                            {"text": "✍️ Ответить клиенту", "callback_data": f"reply:{email_id}"}
+                        ]]
+                    }
+                    send_telegram(message, reply_markup=reply_markup)
+                    log.info(f"Отправлено: {em['sender']}")
+                    time.sleep(2)
 
-                reply_markup = {
-                    "inline_keyboard": [[
-                        {"text": "✍️ Ответить клиенту", "callback_data": f"reply:{email_id}"}
-                    ]]
-                }
+                # Yangi xat keldi — badge yangilaymiz
+                unread_count = count_unread_inbox()
+                update_menu_badge(menu_msg_ids, unread_count, new_badge=True)
+                badge_active = True
 
-                send_telegram(message, reply_markup=reply_markup)
-                log.info(f"Отправлено: {em['sender']}")
-                time.sleep(2)
+            else:
+                # Yangi xat yo'q — agar badge aktiv bo'lsa, odatiy holatga qaytaramiz
+                if badge_active:
+                    unread_count = count_unread_inbox()
+                    update_menu_badge(menu_msg_ids, unread_count, new_badge=False)
+                    badge_active = False
 
-            # FIX 9: loop_count bilan 100 ta tsiklda tozalash — last_update_id emas
             loop_count += 1
             if loop_count % 100 == 0:
                 pending = cleanup_pending(pending)
@@ -1111,7 +1476,7 @@ def main():
 
         except Exception as e:
             log.error(f"Ошибка основного цикла: {e}")
-            send_telegram(f"⚠️ *Agent xatosi yuz berdi. Log faylini tekshiring.*")
+            send_telegram(f"⚠️ *Произошла ошибка агента. Проверьте лог-файл.*")
 
         time.sleep(10)
 
