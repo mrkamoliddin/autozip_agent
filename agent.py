@@ -536,13 +536,9 @@ def fetch_sent_emails(limit: int = 20) -> list:
 def build_menu_text(unread_count: int, new_badge: bool = False) -> tuple:
     """Asosiy 4 bo'limli menyu — rus tilida."""
     badge = " 🔴" if new_badge else ""
-    new_label = f"🆕 Новые сообщения ({unread_count}){badge}" if unread_count > 0 else f"🆕 Новые сообщения{badge}"
+    new_label = f"🔴 Непрочитанные сообщения ({unread_count}){badge}" if unread_count > 0 else f"🔴 Непрочитанные сообщения{badge}"
 
-    text = (
-        f"🏠 *AutoZIP Email Agent*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Выберите раздел:"
-    )
+    text = "🏠 *AutoZIP Email Agent*\n━━━━━━━━━━━━━━━━━━━━"
     keyboard = {
         "inline_keyboard": [
             [{"text": new_label,                    "callback_data": "menu:new"}],
@@ -1029,7 +1025,7 @@ def handle_telegram_updates(pending: dict, last_update_id: int, menu_msg_ids: di
                     else:
                         # Sarlavha xabari
                         send_telegram(
-                            f"🆕 *НОВЫЕ СООБЩЕНИЯ ({len(new_emails)})*\n━━━━━━━━━━━━━━━━━━━━",
+                            f"🔴 *НЕПРОЧИТАННЫЕ СООБЩЕНИЯ ({len(new_emails)})*\n━━━━━━━━━━━━━━━━━━━━",
                             chat_id=chat_id
                         )
                         # Har bir xat uchun alohida xabar + Открыть tugmasi
@@ -1121,7 +1117,7 @@ def handle_telegram_updates(pending: dict, last_update_id: int, menu_msg_ids: di
                 if sec == "new":
                     emails = fetch_new_inbox_emails()
                     send_email_list(chat_id, emails, page=page, section="new",
-                                   title="🆕 *НОВЫЕ СООБЩЕНИЯ*")
+                                   title="🔴 *НЕПРОЧИТАННЫЕ СООБЩЕНИЯ*")
                 elif sec == "inbox":
                     emails = fetch_read_inbox_emails(days=30)
                     send_email_list(chat_id, emails, page=page, section="inbox",
@@ -1153,7 +1149,7 @@ def handle_telegram_updates(pending: dict, last_update_id: int, menu_msg_ids: di
                     page = 0
                 emails = fetch_new_inbox_emails()
                 send_email_list(chat_id, emails, page=page, section="new",
-                               title="🆕 *НОВЫЕ СООБЩЕНИЯ*")
+                               title="🔴 *НЕПРОЧИТАННЫЕ СООБЩЕНИЯ*")
 
             # ── YANGI XATNI OCHISH — GPT TAHLIL ─────────────────────
             elif data.startswith("open_new:"):
