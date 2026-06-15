@@ -1055,11 +1055,14 @@ def handle_telegram_updates(pending: dict, last_update_id: int, menu_msg_ids: di
                 section = data.split(":", 1)[1]
 
                 if section == "main":
-                    unread = count_unread_inbox()
+                    # Tezlik uchun — IMAP ga ulanmasdan, oxirgi saqlangan sonni ishlatamiz
+                    cached = load_json(MENU_MESSAGE_FILE, {})
+                    unread = cached.get("last_unread", 0)
                     mid = send_main_menu(chat_id, unread_count=unread)
                     if mid:
                         menu_msg_ids[chat_id] = mid
-                        save_json(MENU_MESSAGE_FILE, menu_msg_ids)
+                        cached[chat_id] = mid
+                        save_json(MENU_MESSAGE_FILE, cached)
 
                 elif section == "new":
                     send_telegram("⏳ *Загружаю новые сообщения...*", chat_id=chat_id)
@@ -1468,7 +1471,8 @@ def main():
 
     # Ishga tushganda har bir admin uchun asosiy menyuni yuboramiz
     unread_count = count_unread_inbox()
-    menu_msg_ids = {}
+    menu_msg_ids = load_json(MENU_MESSAGE_FILE, {})
+    menu_msg_ids["last_unread"] = unread_count
     for cid in TELEGRAM_CHAT_IDS:
         mid = send_main_menu(cid, unread_count=unread_count)
         if mid:
@@ -1526,6 +1530,8 @@ def main():
 
                 # Yangi xat keldi — badge yangilaymiz
                 unread_count = count_unread_inbox()
+                menu_msg_ids["last_unread"] = unread_count
+                save_json(MENU_MESSAGE_FILE, menu_msg_ids)
                 update_menu_badge(menu_msg_ids, unread_count, new_badge=True)
                 badge_active = True
 
