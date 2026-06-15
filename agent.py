@@ -1478,7 +1478,7 @@ def main():
             log.error(f"Ошибка основного цикла: {e}")
             send_telegram(f"⚠️ *Произошла ошибка агента. Проверьте лог-файл.*")
 
-        time.sleep(10)
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
