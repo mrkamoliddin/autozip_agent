@@ -596,11 +596,16 @@ def fetch_all_counts() -> dict:
         mail.select("INBOX")
         _, unseen_data = mail.search(None, "UNSEEN")
         _, all_data    = mail.search(None, "ALL")
-        counts["unread"] = len(unseen_data[0].split()) if unseen_data[0] else 0
-        counts["inbox"]  = len(all_data[0].split())    if all_data[0]    else 0
+
+        # Bo'sh b'' ni 0 ga aylantirish
+        unseen_ids = [x for x in unseen_data[0].split() if x]
+        all_ids    = [x for x in all_data[0].split()    if x]
+        counts["unread"] = len(unseen_ids)
+        counts["inbox"]  = len(all_ids)
 
         # Sent papkasini topamiz
         _, folders = mail.list()
+        sent_found = False
         for f in folders:
             f_str = f.decode("utf-8", errors="replace") if isinstance(f, bytes) else f
             if any(name.lower() in f_str.lower() for name in ["sent", "отправлен"]):
@@ -608,8 +613,15 @@ def fetch_all_counts() -> dict:
                 result, _ = mail.select(f'"{folder_name}"')
                 if result == "OK":
                     _, sent_data = mail.search(None, "ALL")
-                    counts["sent"] = len(sent_data[0].split()) if sent_data[0] else 0
+                    sent_ids = [x for x in sent_data[0].split() if x]
+                    counts["sent"] = len(sent_ids)
+                    sent_found = True
                     break
+
+        if not sent_found:
+            log.warning("Sent papkasi topilmadi")
+
+        log.info(f"Counts: {counts}")
 
     except Exception as e:
         log.warning(f"fetch_all_counts xato: {e}")
