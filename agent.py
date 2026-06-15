@@ -618,13 +618,10 @@ def fetch_all_counts() -> dict:
                     sent_ids = [x for x in sent_data[0].split() if x]
                     counts["sent"] = len(sent_ids)
                     sent_found = True
-                    log.info(f"Sent papkasi: '{folder_name}', xatlar: {counts['sent']}")
                     break
 
         if not sent_found:
             log.warning("Sent papkasi topilmadi")
-
-        log.info(f"Counts: {counts}")
 
     except Exception as e:
         log.warning(f"fetch_all_counts xato: {e}")
@@ -792,7 +789,7 @@ def fetch_email_full(uid_str: str) -> dict | None:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
         mail.select("INBOX")
-        _, msg_data = mail.fetch(uid_str.encode(), "(RFC822)")
+        _, msg_data = mail.fetch(uid_str.encode(), "(BODY.PEEK[])")
         raw = msg_data[0][1]
         msg = email.message_from_bytes(raw)
         sender  = decode_str(msg.get("From", ""))
@@ -1009,7 +1006,7 @@ def fetch_sender_history(mail_conn, sender_email: str, limit: int = 5) -> list:
         ids = data[0].split()
         recent_ids = ids[-limit-1:-1] if len(ids) > 1 else []
         for uid in reversed(recent_ids):
-            _, msg_data = mail_conn.fetch(uid, "(RFC822)")
+            _, msg_data = mail_conn.fetch(uid, "(BODY.PEEK[])")
             raw = msg_data[0][1]
             msg = email.message_from_bytes(raw)
             subject = decode_str(msg.get("Subject", "(без темы)"))
@@ -1033,7 +1030,7 @@ def fetch_new_emails(seen_ids: set) -> list:
             uid_str = uid.decode()
             if uid_str in seen_ids:
                 continue
-            _, msg_data = mail.fetch(uid, "(RFC822)")
+            _, msg_data = mail.fetch(uid, "(BODY.PEEK[])")
             raw = msg_data[0][1]
             msg = email.message_from_bytes(raw)
             sender  = decode_str(msg.get("From", ""))
