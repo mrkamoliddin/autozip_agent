@@ -469,11 +469,31 @@ def fetch_sent_emails(limit: int = 20) -> list:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
 
-        # Yandex Sent papkasi
-        for folder in ['"Отправленные"', "Sent", "INBOX.Sent"]:
-            result, _ = mail.select(folder)
-            if result == "OK":
-                break
+        # Yandex Sent papkasini topish — LIST orqali
+        selected = False
+        _, folders = mail.list()
+        for f in folders:
+            f_str = f.decode("utf-8", errors="replace") if isinstance(f, bytes) else f
+            if any(name in f_str for name in ["Отправленные", "Sent", "INBOX.Sent"]):
+                # Papka nomini ajratib olamiz
+                parts = f_str.split('"')
+                folder_name = parts[-2] if len(parts) >= 2 else "Sent"
+                result, _ = mail.select(f'"{folder_name}"')
+                if result == "OK":
+                    selected = True
+                    break
+
+        if not selected:
+            # Fallback — oddiy nomlar bilan urinib ko'ramiz
+            for folder in ["Sent", "INBOX.Sent", "Sent Items"]:
+                result, _ = mail.select(folder)
+                if result == "OK":
+                    selected = True
+                    break
+
+        if not selected:
+            log.warning("Sent papkasi topilmadi")
+            return []
 
         _, data = mail.search(None, "ALL")
         ids = data[0].split()
@@ -484,7 +504,7 @@ def fetch_sent_emails(limit: int = 20) -> list:
             raw_headers = msg_data[0][1]
             msg = email.message_from_bytes(raw_headers)
 
-            to_addr = decode_str(msg.get("To", ""))
+            to_addr  = decode_str(msg.get("To", ""))
             subject  = decode_str(msg.get("Subject", "(без темы)"))
             date_str = msg.get("Date", "")
 
