@@ -1500,40 +1500,31 @@ def main():
 
             if new_emails:
                 for em in new_emails:
-                    log.info(f"Анализирую: {em['sender']}")
+                    log.info(f"Yangi xat: {em['sender']}")
                     email_id = em["uid"]
 
                     seen_ids.add(email_id)
                     seen_ids = trim_seen_ids(seen_ids)
                     save_json(SEEN_IDS_FILE, list(seen_ids))
 
-                    analysis = analyze_email(em["sender"], em["subject"], em["body"], em.get("history", []))
-                    message  = format_telegram_message(em["sender"], em["subject"], analysis)
+                    # pending ga saqlaymiz — "Открыть" bosilganda tahlil qilinadi
+                    if email_id not in pending:
+                        pending[email_id] = {
+                            "sender":     em["sender"],
+                            "subject":    em["subject"],
+                            "body":       em["body"],
+                            "history":    em.get("history", []),
+                            "created_at": datetime.now().isoformat()
+                        }
+                        save_json(PENDING_FILE, pending)
 
-                    pending[email_id] = {
-                        "sender":     em["sender"],
-                        "subject":    em["subject"],
-                        "body":       em["body"],
-                        "history":    em.get("history", []),
-                        "created_at": datetime.now().isoformat()
-                    }
-                    save_json(PENDING_FILE, pending)
-
-                    reply_markup = {
-                        "inline_keyboard": [[
-                            {"text": "✍️ Ответить клиенту", "callback_data": f"reply:{email_id}"}
-                        ]]
-                    }
-                    send_telegram(message, reply_markup=reply_markup)
-                    log.info(f"Отправлено: {em['sender']}")
-                    time.sleep(2)
-
-                # Yangi xat keldi — badge yangilaymiz
+                # Faqat badge yangilaymiz — alohida xabar yuborilmaydi
                 unread_count = count_unread_inbox()
                 menu_msg_ids["last_unread"] = unread_count
                 save_json(MENU_MESSAGE_FILE, menu_msg_ids)
                 update_menu_badge(menu_msg_ids, unread_count, new_badge=True)
                 badge_active = True
+                log.info(f"Badge yangilandi: {unread_count} o'qilmagan")
 
             else:
                 # Yangi xat yo'q — agar badge aktiv bo'lsa, odatiy holatga qaytaramiz
