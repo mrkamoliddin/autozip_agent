@@ -533,28 +533,33 @@ def fetch_sent_emails(limit: int = 20) -> list:
                 pass
     return sent_emails
 
-def build_menu_text(unread_count: int, new_badge: bool = False) -> tuple:
-    """Asosiy 4 bo'limli menyu — rus tilida."""
+def build_menu_text(counts: dict = None, new_badge: bool = False) -> tuple:
+    """Asosiy 4 bo'limli menyu — har bo'lim soni bilan."""
+    if counts is None:
+        counts = {}
     badge = " 🔴" if new_badge else ""
-    new_label = f"🔴 Непрочитанные сообщения ({unread_count}){badge}" if unread_count > 0 else f"🔴 Непрочитанные сообщения{badge}"
+    unread = counts.get("unread", 0)
+    inbox  = counts.get("inbox", 0)
+    sent   = counts.get("sent", 0)
+
+    unread_label = f"🔴 Непрочитанные сообщения ({unread}){badge}" if unread > 0 else f"🔴 Непрочитанные сообщения{badge}"
+    inbox_label  = f"📥 Входящие сообщения ({inbox})"  if inbox  > 0 else "📥 Входящие сообщения"
+    sent_label   = f"📤 Отправленные сообщения ({sent})" if sent  > 0 else "📤 Отправленные сообщения"
 
     text = "🏠 *AutoZIP Email Agent*\n━━━━━━━━━━━━━━━━━━━━"
     keyboard = {
         "inline_keyboard": [
-            [{"text": new_label,                    "callback_data": "menu:new"}],
-            [{"text": "📥 Входящие сообщения",      "callback_data": "menu:inbox"}],
-            [{"text": "📤 Отправленные сообщения",  "callback_data": "menu:sent"}],
-            [{"text": "🔍 Поиск нового клиента",    "callback_data": "menu:search"}],
+            [{"text": unread_label, "callback_data": "menu:new"}],
+            [{"text": inbox_label,  "callback_data": "menu:inbox"}],
+            [{"text": sent_label,   "callback_data": "menu:sent"}],
+            [{"text": "🔍 Поиск нового клиента", "callback_data": "menu:search"}],
         ]
     }
     return text, keyboard
 
-def send_main_menu(chat_id: str, unread_count: int = 0) -> int | None:
-    """
-    Asosiy menyuni yuboradi va message_id ni qaytaradi.
-    Qaytarilgan ID keyinchalik badge yangilash uchun saqlanadi.
-    """
-    text, keyboard = build_menu_text(unread_count)
+def send_main_menu(chat_id: str, counts: dict = None) -> int | None:
+    """Asosiy menyuni yuboradi va message_id ni qaytaradi."""
+    text, keyboard = build_menu_text(counts)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id":      chat_id,
@@ -572,26 +577,59 @@ def send_main_menu(chat_id: str, unread_count: int = 0) -> int | None:
         log.error(f"send_main_menu exception: {e}")
     return None
 
-def update_menu_badge(menu_msg_ids: dict, unread_count: int, new_badge: bool = False):
-    """
-    Har bir admindagi menyu xabarini yangilaydi (badge qo'shadi/olib tashlaydi).
-    menu_msg_ids = {chat_id: message_id}
-    """
-    text, keyboard = build_menu_text(unread_count, new_badge=new_badge)
+def update_menu_badge(menu_msg_ids: dict, counts: dict, new_badge: bool = False):
+    """Har bir admindagi menyu xabarini yangilaydi."""
+    text, keyboard = build_menu_text(counts, new_badge=new_badge)
     for cid, mid in menu_msg_ids.items():
-        if mid:
+        if isinstance(mid, int):
             edit_telegram_message(cid, mid, text, reply_markup=keyboard)
 
+def fetch_all_counts() -> dict:
+    """Bitta IMAP ulanishda barcha sonlarni oladi."""
+    mail = None
+    counts = {"unread": 0, "inbox": 0, "sent": 0}
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
+
+        # INBOX — o'qilmagan va jami
+        mail.select("INBOX")
+        _, unseen_data = mail.search(None, "UNSEEN")
+        _, all_data    = mail.search(None, "ALL")
+        counts["unread"] = len(unseen_data[0].split()) if unseen_data[0] else 0
+        counts["inbox"]  = len(all_data[0].split())    if all_data[0]    else 0
+
+        # Sent papkasini topamiz
+        _, folders = mail.list()
+        for f in folders:
+            f_str = f.decode("utf-8", errors="replace") if isinstance(f, bytes) else f
+            if any(name.lower() in f_str.lower() for name in ["sent", "отправлен"]):
+                folder_name = f_str.split('"')[-2] if '"' in f_str else f_str.split()[-1].strip('"')
+                result, _ = mail.select(f'"{folder_name}"')
+                if result == "OK":
+                    _, sent_data = mail.search(None, "ALL")
+                    counts["sent"] = len(sent_data[0].split()) if sent_data[0] else 0
+                    break
+
+    except Exception as e:
+        log.warning(f"fetch_all_counts xato: {e}")
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+    return counts
+
 def count_unread_inbox() -> int:
-    """IMAP dan o'qilmagan xatlar sonini olish."""
+    """IMAP dan faqat o'qilmagan xatlar sonini olish."""
     mail = None
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
         mail.select("INBOX")
         _, data = mail.search(None, "UNSEEN")
-        ids = data[0].split()
-        return len(ids)
+        return len(data[0].split()) if data[0] else 0
     except Exception as e:
         log.warning(f"count_unread_inbox xato: {e}")
         return 0
@@ -601,6 +639,8 @@ def count_unread_inbox() -> int:
                 mail.logout()
             except Exception:
                 pass
+
+
 
 
 
@@ -1055,10 +1095,9 @@ def handle_telegram_updates(pending: dict, last_update_id: int, menu_msg_ids: di
                 section = data.split(":", 1)[1]
 
                 if section == "main":
-                    # Tezlik uchun — IMAP ga ulanmasdan, oxirgi saqlangan sonni ishlatamiz
                     cached = load_json(MENU_MESSAGE_FILE, {})
-                    unread = cached.get("last_unread", 0)
-                    mid = send_main_menu(chat_id, unread_count=unread)
+                    counts = cached.get("last_counts", {"unread": 0, "inbox": 0, "sent": 0})
+                    mid = send_main_menu(chat_id, counts=counts)
                     if mid:
                         menu_msg_ids[chat_id] = mid
                         cached[chat_id] = mid
@@ -1365,12 +1404,14 @@ def handle_telegram_updates(pending: dict, last_update_id: int, menu_msg_ids: di
 
             # /start va /menu — asosiy menyuni ko'rsatish
             if text.lower() in ("/start", "/menu"):
-                unread = count_unread_inbox()
-                mid = send_main_menu(chat_id, unread_count=unread)
+                counts = fetch_all_counts()
+                mid = send_main_menu(chat_id, counts=counts)
                 if mid:
-                    menu_msg_ids = load_json(MENU_MESSAGE_FILE, {})
+                    cached = load_json(MENU_MESSAGE_FILE, {})
+                    cached[chat_id] = mid
+                    cached["last_counts"] = counts
+                    save_json(MENU_MESSAGE_FILE, cached)
                     menu_msg_ids[chat_id] = mid
-                    save_json(MENU_MESSAGE_FILE, menu_msg_ids)
                 continue
 
             # Boshqa / buyruqlarni e'tiborsiz qoldiramiz
@@ -1470,11 +1511,11 @@ def main():
     send_telegram("🤖 *Email-агент запущен!*\nНовые письма от клиентов будут автоматически анализироваться.")
 
     # Ishga tushganda har bir admin uchun asosiy menyuni yuboramiz
-    unread_count = count_unread_inbox()
+    counts = fetch_all_counts()
     menu_msg_ids = load_json(MENU_MESSAGE_FILE, {})
-    menu_msg_ids["last_unread"] = unread_count
+    menu_msg_ids["last_counts"] = counts
     for cid in TELEGRAM_CHAT_IDS:
-        mid = send_main_menu(cid, unread_count=unread_count)
+        mid = send_main_menu(cid, counts=counts)
         if mid:
             menu_msg_ids[cid] = mid
     save_json(MENU_MESSAGE_FILE, menu_msg_ids)
@@ -1519,24 +1560,32 @@ def main():
                         save_json(PENDING_FILE, pending)
 
                 # Faqat badge yangilaymiz — alohida xabar yuborilmaydi
-                unread_count = count_unread_inbox()
-                menu_msg_ids["last_unread"] = unread_count
+                counts = fetch_all_counts()
+                menu_msg_ids["last_counts"] = counts
                 save_json(MENU_MESSAGE_FILE, menu_msg_ids)
-                update_menu_badge(menu_msg_ids, unread_count, new_badge=True)
+                update_menu_badge(menu_msg_ids, counts, new_badge=True)
                 badge_active = True
-                log.info(f"Badge yangilandi: {unread_count} o'qilmagan")
+                log.info(f"Badge yangilandi: {counts}")
 
             else:
-                # Yangi xat yo'q — agar badge aktiv bo'lsa, odatiy holatga qaytaramiz
                 if badge_active:
-                    unread_count = count_unread_inbox()
-                    update_menu_badge(menu_msg_ids, unread_count, new_badge=False)
+                    counts = fetch_all_counts()
+                    menu_msg_ids["last_counts"] = counts
+                    save_json(MENU_MESSAGE_FILE, menu_msg_ids)
+                    update_menu_badge(menu_msg_ids, counts, new_badge=False)
                     badge_active = False
 
             loop_count += 1
             if loop_count % 100 == 0:
                 pending = cleanup_pending(pending)
                 save_json(PENDING_FILE, pending)
+
+            # Har daqiqada menyuni yangilaymiz — yangi xat bo'lmasa ham
+            if not new_emails and not badge_active:
+                counts = fetch_all_counts()
+                menu_msg_ids["last_counts"] = counts
+                save_json(MENU_MESSAGE_FILE, menu_msg_ids)
+                update_menu_badge(menu_msg_ids, counts, new_badge=False)
 
         except Exception as e:
             log.error(f"Ошибка основного цикла: {e}")
