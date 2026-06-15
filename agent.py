@@ -605,6 +605,10 @@ def fetch_all_counts() -> dict:
 
         # Sent papkasini topamiz
         _, folders = mail.list()
+        # Debug: barcha papka nomlarini logga chiqaramiz
+        for f in folders:
+            f_str = f.decode("utf-8", errors="replace") if isinstance(f, bytes) else f
+            log.info(f"IMAP papka: {f_str}")
         sent_found = False
         for f in folders:
             f_str = f.decode("utf-8", errors="replace") if isinstance(f, bytes) else f
