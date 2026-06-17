@@ -633,7 +633,20 @@ def fetch_all_counts() -> dict:
                 pass
     return counts
 
-def count_unread_inbox() -> int:
+def should_restart() -> bool:
+    """Har kuni soat 8:00 da agentni qayta ishga tushirish."""
+    now = datetime.now()
+    restart_file = "last_restart.json"
+    last = load_json(restart_file, {})
+    last_date = last.get("date", "")
+    today = now.strftime("%Y-%m-%d")
+
+    if now.hour >= 8 and last_date != today:
+        save_json(restart_file, {"date": today})
+        return True
+    return False
+
+
     """IMAP dan faqat o'qilmagan xatlar sonini olish."""
     mail = None
     try:
@@ -1524,10 +1537,13 @@ def main():
 
     # Ishga tushganda har bir admin uchun asosiy menyuni yuboramiz
     counts = fetch_all_counts()
+    log.info(f"Counts: {counts}")
     menu_msg_ids = load_json(MENU_MESSAGE_FILE, {})
     menu_msg_ids["last_counts"] = counts
     for cid in TELEGRAM_CHAT_IDS:
+        log.info(f"Menyu yuborilmoqda: {cid}")
         mid = send_main_menu(cid, counts=counts)
+        log.info(f"Menyu yuborildi: {cid} → message_id={mid}")
         if mid:
             menu_msg_ids[cid] = mid
     save_json(MENU_MESSAGE_FILE, menu_msg_ids)
@@ -1560,7 +1576,6 @@ def main():
                     seen_ids = trim_seen_ids(seen_ids)
                     save_json(SEEN_IDS_FILE, list(seen_ids))
 
-                    # pending ga saqlaymiz — "Открыть" bosilganda tahlil qilinadi
                     if email_id not in pending:
                         pending[email_id] = {
                             "sender":     em["sender"],
@@ -1571,7 +1586,6 @@ def main():
                         }
                         save_json(PENDING_FILE, pending)
 
-                # Faqat badge yangilaymiz — alohida xabar yuborilmaydi
                 counts = fetch_all_counts()
                 menu_msg_ids["last_counts"] = counts
                 save_json(MENU_MESSAGE_FILE, menu_msg_ids)
@@ -1580,24 +1594,25 @@ def main():
                 log.info(f"Badge yangilandi: {counts}")
 
             else:
-                if badge_active:
-                    counts = fetch_all_counts()
-                    menu_msg_ids["last_counts"] = counts
-                    save_json(MENU_MESSAGE_FILE, menu_msg_ids)
-                    update_menu_badge(menu_msg_ids, counts, new_badge=False)
+                # Har daqiqada menyuni yangilaymiz
+                counts = fetch_all_counts()
+                menu_msg_ids["last_counts"] = counts
+                save_json(MENU_MESSAGE_FILE, menu_msg_ids)
+                update_menu_badge(menu_msg_ids, counts, new_badge=badge_active)
+                if badge_active and counts.get("unread", 0) == 0:
                     badge_active = False
+
+            # Har kuni soat 8:00 da restart
+            if should_restart():
+                log.info("Kunlik restart: 08:00")
+                send_telegram("🔄 *Агент перезапускается (ежедневный рестарт 08:00)*")
+                import os as _os
+                _os.execv(sys.executable, [sys.executable] + sys.argv)
 
             loop_count += 1
             if loop_count % 100 == 0:
                 pending = cleanup_pending(pending)
                 save_json(PENDING_FILE, pending)
-
-            # Har daqiqada menyuni yangilaymiz — yangi xat bo'lmasa ham
-            if not new_emails and not badge_active:
-                counts = fetch_all_counts()
-                menu_msg_ids["last_counts"] = counts
-                save_json(MENU_MESSAGE_FILE, menu_msg_ids)
-                update_menu_badge(menu_msg_ids, counts, new_badge=False)
 
         except Exception as e:
             log.error(f"Ошибка основного цикла: {e}")
